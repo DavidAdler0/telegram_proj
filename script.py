@@ -38,11 +38,8 @@ class TelegramRecentAnalyzer:
 
         # Elasticsearch Connection
         try:
-            self.es = Elasticsearch(
-        ['http://localhost:9200'],  # ציין את ה-URL עם סכימה (http:// או https://)
-        timeout=30  # ניתן להוסיף עוד פרמטרים כמו timeout
-        )
-
+            self.es = Elasticsearch(["http://localhost:9200"])
+            print(self.es)
             # Create index if not exists
             if not self.es.indices.exists(index='telegram_messages'):
                 self.es.indices.create(index='telegram_messages', body={
@@ -83,7 +80,24 @@ class TelegramRecentAnalyzer:
         await self.client.start(phone=self.phone_number)
         print("Connected to Telegram successfully!")
 
-    async def fetch_and_store_recent_messages(self, time_window=5):
+    async def fetch_and_store_recent_messages(self, time_window=15):
+
+        def clean_text(text):
+            """
+            Function to clean text by removing non-Hebrew words and non-alphabetic characters (except spaces).
+
+            :param text: The input text to clean
+            :return: Cleaned text with only Hebrew characters and spaces
+            """
+            # Keep only Hebrew characters and spaces (remove non-Hebrew letters and punctuation)
+            hebrew_text = re.sub(r'[^א-ת\s]', '', text)
+
+            # Filter out words that contain only non-Hebrew characters
+            hebrew_words = [word for word in hebrew_text.split() if re.match(r'^[א-ת]+$', word)]
+
+            # Join words back into a cleaned text
+            return ' '.join(hebrew_words)
+
         """
         Fetch messages from all dialogs in the last 5 minutes for Hebrew content
         and store them in MongoDB and Elasticsearch
@@ -107,7 +121,7 @@ class TelegramRecentAnalyzer:
 
             try:
                 # Fetch messages from this dialog
-                messages = await self.client.get_messages(dialog.entity, limit=100)
+                messages = await self.client.get_messages(dialog.entity, limit=50)
 
                 for msg in messages:
                     # Ensure msg.date is timezone-aware
@@ -118,15 +132,15 @@ class TelegramRecentAnalyzer:
                     if not msg.text or msg.date < time_threshold:
                         continue
 
-                    # Basic text cleaning and Hebrew content filtering
-                    clean_text = re.sub(r'\s+', ' ', msg.text).strip()
+                    # Clean the text by removing non-Hebrew words and non-alphabetical characters
+                    clean_text_content = clean_text(msg.text)
 
-                    # Basic Hebrew language detection (simple heuristic)
-                    if not any('\u0590' <= char <= '\u05FF' for char in clean_text):
+                    # Skip empty cleaned texts
+                    if not clean_text_content:
                         continue
 
                     message_data = {
-                        'text': clean_text,
+                        'text': clean_text_content,  # Use cleaned text, not the function itself
                         'channel': dialog.name or 'Unknown',
                         'date': msg.date
                     }
@@ -139,7 +153,7 @@ class TelegramRecentAnalyzer:
                     # Store in Elasticsearch
                     if self.es:
                         es_doc = {
-                            'text': clean_text,
+                            'text': clean_text_content,  # Use cleaned text, not the function itself
                             'channel': dialog.name or 'Unknown',
                             'date': msg.date
                         }
@@ -150,67 +164,75 @@ class TelegramRecentAnalyzer:
 
         return processed_messages
 
-    def cluster_messages_by_similarity(self, similarity_threshold=0.6):
+    def cluster_messages_by_similarity(self, similarity_threshold=0.8, max_messages=1000):
         """
-        Cluster messages using Elasticsearch More Like This query
+        Cluster messages using Elasticsearch's More Like This query with simplified approach
 
         :param similarity_threshold: Similarity threshold for clustering (0-1)
+        :param max_messages: Maximum number of messages to process
         :return: Clustered messages
         """
-        # Retrieve all messages from Elasticsearch
+        # Retrieve base messages
         search_body = {
-            "query": {
-                "match_all": {}
-            },
-            "size": 1000  # Adjust as needed
+            "query": {"match_all": {}},
+            "size": max_messages
         }
         search_results = self.es.search(index='telegram_messages', body=search_body)
 
-        # Group messages into clusters
+        # Dictionary to store clusters
         clustered_messages = {}
-        processed_indices = set()
+        processed_ids = set()
 
-        for idx, hit in enumerate(search_results['hits']['hits']):
-            if idx in processed_indices:
+        # Iterate through messages
+        for idx, base_hit in enumerate(search_results['hits']['hits']):
+            # Skip if already processed
+            if base_hit['_id'] in processed_ids:
                 continue
 
-            # Create a new cluster
-            current_cluster = [hit]
-            processed_indices.add(idx)
+            # Start a new cluster
+            current_cluster = [base_hit]
+            processed_ids.add(base_hit['_id'])
 
-            # Find similar messages for this cluster
-            for other_idx, other_hit in enumerate(search_results['hits']['hits']):
-                if other_idx in processed_indices:
-                    continue
-
-                # Use More Like This query to check similarity
-                mlt_query = {
-                    "query": {
-                        "more_like_this": {
-                            "fields": ["text"],
-                            "like": [
-                                {
-                                    "_index": "telegram_messages",
-                                    "_id": hit['_id']
-                                }
-                            ],
-                            "min_term_freq": 1,
-                            "max_query_terms": 12,
-                            "minimum_should_match": f"{int(similarity_threshold * 100)}%"
-                        }
+            # More Like This query
+            mlt_query = {
+                "query": {
+                    "more_like_this": {
+                        "fields": ["text"],
+                        "like": [
+                            {
+                                "_index": "telegram_messages",
+                                "_id": base_hit['_id']
+                            }
+                        ],
+                        "min_term_freq": 1,
+                        "max_query_terms": 20,
+                        "minimum_should_match": f"{int(similarity_threshold * 100)}%"
                     }
                 }
+            }
 
-                # Check if other document matches the cluster
-                similar_search = self.es.search(index='telegram_messages', body=mlt_query)
+            # Find similar messages
+            similar_results = self.es.search(index='telegram_messages', body=mlt_query, size=max_messages)
 
-                # If similar, add to cluster
-                if any(other_hit['_id'] == similar_hit['_id'] for similar_hit in similar_search['hits']['hits']):
-                    current_cluster.append(other_hit)
-                    processed_indices.add(other_idx)
+            # Add similar messages to cluster
+            for similar_hit in similar_results['hits']['hits']:
+                if similar_hit['_id'] not in processed_ids:
+                    current_cluster.append(similar_hit)
+                    processed_ids.add(similar_hit['_id'])
 
-            # Store cluster
-            clustered_messages[len(clustered_messages)] = current_cluster
+            # Store cluster if it has multiple messages
+            if len(current_cluster) > 1:
+                clustered_messages[len(clustered_messages)] = current_cluster
+
+        # Print cluster summary
+        print(f"\n--- Message Clusters ---")
+        for cluster_id, cluster_messages in clustered_messages.items():
+            print(f"\nCluster {cluster_id}:")
+            print(f"Number of messages: {len(cluster_messages)}")
+            print("Sample messages:")
+            for msg in cluster_messages[:3]:  # Print first 3 messages as sample
+                print(f"- {msg['_source']['text'][:100]}... (from {msg['_source']['channel']})")
+            print("Channels:", set(msg['_source']['channel'] for msg in cluster_messages))
 
         return clustered_messages
 
@@ -259,10 +281,8 @@ class TelegramRecentAnalyzer:
         if not messages:
             print("No recent Hebrew messages found.")
             return
-
         # Cluster messages by similarity
         clustered_messages = self.cluster_messages_by_similarity()
-
         # Print cluster summaries
         print("\n--- Message Clusters ---")
         for cluster_id, cluster_messages in clustered_messages.items():
