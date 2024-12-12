@@ -118,6 +118,7 @@ class TelegramRecentAnalyzer:
 
         return ' '.join(words)
 
+
     async def connect(self):
         """Connect to Telegram"""
         await self.client.start(phone=self.phone_number)
@@ -144,8 +145,11 @@ class TelegramRecentAnalyzer:
 
     async def analyze_recent_messages(self):
         """
-        Improved clustering method with strict similarity requirements
+        Improved clustering method with time-based filtering and strict similarity requirements
         """
+        # Set the time threshold (e.g., 10 minutes ago)
+        time_threshold = datetime.now(timezone.utc) - timedelta(minutes=10)
+
         await self.connect()
 
         # Get all dialogs
@@ -186,9 +190,14 @@ class TelegramRecentAnalyzer:
                 if raw_messages:
                     self.raw_messages_collection.insert_many(raw_messages)
 
-                # 3. Clean messages
+                # 3. Clean and filter messages based on time threshold
                 clean_messages = []
                 for msg in messages:
+                    # Time-based filtering
+                    if msg.date < time_threshold:
+                        print(f"⏰ Skipping message outside time threshold: {msg.text[:50]}...")
+                        continue
+
                     cleaned_text = self.clean_hebrew_text(msg.text, recurring_texts)
 
                     if cleaned_text:
@@ -268,7 +277,9 @@ class TelegramRecentAnalyzer:
                         }
                         self.es.index(index='telegram_messages', body=es_doc)
 
-                print(f"✅ Processed {len(messages)} messages from {dialog.name or 'Unknown Dialog'}")
+                print(f"✅ Processed {len(clean_messages)} messages from {dialog.name or 'Unknown Dialog'}")
+                if len(messages) != len(clean_messages):
+                    print(f"🕒 {len(messages) - len(clean_messages)} messages filtered out of time threshold")
 
             except Exception as e:
                 print(f"❌ Error processing dialog {dialog.name or 'Unknown Dialog'}: {e}")
